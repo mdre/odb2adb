@@ -1,0 +1,447 @@
+package com.migration;
+
+import com.orientechnologies.orient.core.db.OrientDB;
+import com.orientechnologies.orient.core.db.OrientDBConfig;
+import com.orientechnologies.orient.core.db.ODatabasePool;
+import com.orientechnologies.orient.core.db.ODatabaseSession;
+import com.orientechnologies.orient.core.metadata.schema.OClass;
+import com.orientechnologies.orient.core.metadata.schema.OProperty;
+import com.orientechnologies.orient.core.index.OIndex;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.io.FileReader;
+import java.io.IOException;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.util.concurrent.atomic.AtomicLong;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+
+import com.migration.ui.MigrationScreen;
+
+public class Migrator {
+
+    public static LocalDateTime startTime;
+    public static long startTimeMillis;
+    public static AtomicLong recordsMigrated = new AtomicLong(0);
+    public static AtomicLong totalRecordsToMigrate = new AtomicLong(0);
+    public static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    public static void logProgress(String threadName, String className, long processedRecords, MigrationScreen screen) {
+        long completed = recordsMigrated.addAndGet(processedRecords);
+        long elapsed = System.currentTimeMillis() - startTimeMillis;
+        double avgMsPerRecord = elapsed > 0 && completed > 0 ? (double) elapsed / completed : 0;
+
+        long totalRecords = totalRecordsToMigrate.get();
+        double estimatedTotalHours = (avgMsPerRecord * totalRecords) / (1000.0 * 60 * 60);
+        long remainingMs = (long) (avgMsPerRecord * (Math.max(0, totalRecords - completed)));
+        LocalDateTime estimatedEndTime = LocalDateTime.now().plus(remainingMs, ChronoUnit.MILLIS);
+
+        String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                (elapsed / 1000) % 60);
+
+        if (screen != null) {
+            String eta = estimatedEndTime.format(dtf);
+            screen.updateGlobal(null, completed, totalRecords, eta, startTime.format(dtf), elapsedTimeStr);
+        } else {
+            System.out.printf("[%s] Finished migrating %s (%d records). Completed: %d/%d records.%n",
+                    threadName, className, processedRecords, completed, totalRecords);
+            System.out.printf("   -> Est. total hours: %.2f | Est. End Time: %s%n", estimatedTotalHours,
+                    estimatedEndTime.format(dtf));
+        }
+    }
+
+    public static void main(String[] args) {
+        boolean schemaOnly = false;
+        String dumpSchemaPath = null;
+        String configPath = "config.json";
+        boolean debug = false;
+        for (int i = 0; i < args.length; i++) {
+            String arg = args[i];
+            if (arg.equalsIgnoreCase("-so")) {
+                schemaOnly = true;
+            } else if (arg.equalsIgnoreCase("-debug")) {
+                debug = true;
+            } else if (arg.equalsIgnoreCase("-dumpSchema") && i + 1 < args.length) {
+                dumpSchemaPath = args[++i];
+                schemaOnly = true;
+            } else if (!arg.startsWith("-")) {
+                configPath = arg;
+            }
+        }
+
+        JsonObject config;
+        try (FileReader reader = new FileReader(configPath)) {
+            config = JsonParser.parseReader(reader).getAsJsonObject();
+        } catch (IOException e) {
+            System.err.println("Could not load config file: " + configPath);
+            return;
+        }
+
+        String odbUrl = config.has("ODB_URL") ? config.get("ODB_URL").getAsString() : "remote:localhost";
+        String odbDb = config.has("ODB_DB") ? config.get("ODB_DB").getAsString() : "mydb";
+        String odbUser = config.has("ODB_USER") ? config.get("ODB_USER").getAsString() : "root";
+        String odbPass = config.has("ODB_PASS") ? config.get("ODB_PASS").getAsString() : "root";
+
+        String adbHost = config.has("ADB_HOST") ? config.get("ADB_HOST").getAsString() : "localhost";
+        int adbPort = config.has("ADB_PORT") ? config.get("ADB_PORT").getAsInt() : 2480;
+        String adbDb = config.has("ADB_DB") ? config.get("ADB_DB").getAsString() : "mydb";
+        String adbUser = config.has("ADB_USER") ? config.get("ADB_USER").getAsString() : "root";
+        String adbPass = config.has("ADB_PASS") ? config.get("ADB_PASS").getAsString() : "root";
+
+        String mapDbPath = config.has("MAPDB_PATH") ? config.get("MAPDB_PATH").getAsString() : "migration_mapping.db";
+        int threadCount = config.has("THREADS") ? config.get("THREADS").getAsInt() : 4;
+        int batchSize = config.has("BATCH_SIZE") ? config.get("BATCH_SIZE").getAsInt() : 50000;
+
+        startTime = LocalDateTime.now();
+        startTimeMillis = System.currentTimeMillis();
+        System.out.println("Starting Migration Process at: " + startTime.format(dtf));
+
+        OrientDB orientDB = new OrientDB(odbUrl, odbUser, odbPass, OrientDBConfig.defaultConfig());
+        ODatabasePool pool = new ODatabasePool(orientDB, odbDb, odbUser, odbPass);
+
+        ArcadeBatchClient arcadeClient = new ArcadeBatchClient(adbHost, adbPort, adbDb, adbUser, adbPass);
+        arcadeClient.setDebug(debug);
+        MapDbStore mapDbStore = new MapDbStore(mapDbPath);
+
+        MigrationScreen screen = new MigrationScreen(threadCount);
+        try {
+            screen.init();
+            screen.updateStatus("Connecting to databases...");
+        } catch (Exception e) {
+            System.err.println("Failed to start TUI: " + e.getMessage());
+            screen = null; // fallback to stdout if TUI fails? No wait, we already stripped stdout on
+                           // workers.
+        }
+
+        if (screen != null)
+            screen.updateStatus("Extracting schema from OrientDB...");
+        System.out.println("Connected. Extracting schema from OrientDB...");
+
+        List<OClass> vertexClasses = new ArrayList<>();
+        List<OClass> edgeClasses = new ArrayList<>();
+        boolean createSchema = config.has("CREATE_SCHEMA") ? config.get("CREATE_SCHEMA").getAsBoolean() : true;
+
+        List<String> skipClasses = new ArrayList<>();
+        if (config.has("SKIP")) {
+            config.get("SKIP").getAsJsonArray().forEach(e -> skipClasses.add(e.getAsString()));
+        }
+
+        List<String> onlyThisClasses = new ArrayList<>();
+        if (config.has("ONLY_THIS")) {
+            config.get("ONLY_THIS").getAsJsonArray().forEach(e -> onlyThisClasses.add(e.getAsString()));
+        }
+
+        try (ODatabaseSession session = pool.acquire()) {
+            for (OClass oClass : session.getMetadata().getSchema().getClasses()) {
+                String className = oClass.getName();
+                boolean toImport = true;
+
+                if (skipClasses.contains(className)) {
+                    toImport = false;
+                } else if (!onlyThisClasses.isEmpty() && !onlyThisClasses.contains(className)) {
+                    toImport = false;
+                }
+
+                if (oClass.isSubClassOf("V") && !className.equals("V")) {
+                    vertexClasses.add(oClass);
+                    if (toImport)
+                        totalRecordsToMigrate.addAndGet(session.countClass(className));
+                } else if (oClass.isSubClassOf("E") && !className.equals("E")) {
+                    edgeClasses.add(oClass);
+                    if (toImport)
+                        totalRecordsToMigrate.addAndGet(session.countClass(className));
+                }
+            }
+        }
+
+        vertexClasses = sortTopologically(vertexClasses);
+        edgeClasses = sortTopologically(edgeClasses);
+
+        if (screen != null)
+            screen.updateGlobal("Initializing Schema", 0, totalRecordsToMigrate.get(), "...", startTime.format(dtf),
+                    "00:00:00");
+
+        if (createSchema) {
+            if (screen != null)
+                screen.updateStatus(
+                        dumpSchemaPath != null ? "Dumping schema to file..." : "Initializing schema in ArcadeDB...");
+            System.out.println(dumpSchemaPath != null ? "Dumping schema to file: " + dumpSchemaPath
+                    : "Initializing schema in ArcadeDB...");
+            java.io.PrintWriter dumpWriter = null;
+            try {
+                if (dumpSchemaPath != null) {
+                    dumpWriter = new java.io.PrintWriter(new java.io.FileWriter(dumpSchemaPath));
+                }
+                try (ODatabaseSession session = pool.acquire()) {
+                    for (OClass vClass : vertexClasses) {
+                        List<String> superTypes = new ArrayList<>();
+                        for (OClass superClass : vClass.getSuperClasses()) {
+                            if (!superClass.getName().equals("V")) {
+                                superTypes.add("`" + superClass.getName() + "`");
+                            }
+                        }
+                        String extendsClause = superTypes.isEmpty() ? "" : " EXTENDS " + String.join(", ", superTypes);
+                        String cmd1 = "CREATE VERTEX TYPE `" + vClass.getName() + "`" + " IF NOT EXISTS"
+                                + extendsClause;
+                        if (dumpWriter != null) {
+                            dumpWriter.println(cmd1 + ";");
+                        } else {
+                            arcadeClient.executeCommand(cmd1);
+                        }
+                        if (superTypes.isEmpty()) {
+                            String cmd2 = "CREATE PROPERTY `" + vClass.getName() + "`.odbRID IF NOT EXISTS STRING";
+                            String cmd3 = "CREATE INDEX IF NOT EXISTS ON `" + vClass.getName() + "` (odbRID) NOTUNIQUE";
+                            if (dumpWriter != null) {
+                                dumpWriter.println(cmd2 + ";");
+                                dumpWriter.println(cmd3 + ";");
+                            } else {
+                                arcadeClient.executeCommand(cmd2);
+                                arcadeClient.executeCommand(cmd3);
+                            }
+                        }
+                        createPropertiesAndIndexes(vClass, arcadeClient, dumpWriter);
+                    }
+                    for (OClass eClass : edgeClasses) {
+                        List<String> superTypes = new ArrayList<>();
+                        for (OClass superClass : eClass.getSuperClasses()) {
+                            if (!superClass.getName().equals("E")) {
+                                superTypes.add("`" + superClass.getName() + "`");
+                            }
+                        }
+                        String extendsClause = superTypes.isEmpty() ? "" : " EXTENDS " + String.join(", ", superTypes);
+                        String cmd1 = "CREATE EDGE TYPE `" + eClass.getName() + "`" + " IF NOT EXISTS " + extendsClause;
+                        if (dumpWriter != null) {
+                            dumpWriter.println(cmd1 + ";");
+                        } else {
+                            arcadeClient.executeCommand(cmd1);
+                        }
+                        createPropertiesAndIndexes(eClass, arcadeClient, dumpWriter);
+                    }
+                }
+            } catch (Exception e) {
+                if (screen != null)
+                    screen.close();
+                System.err.println("Fatal: Could not initialize ArcadeDB schema: " + e.getMessage());
+                e.printStackTrace();
+                return;
+            } finally {
+                if (dumpWriter != null) {
+                    dumpWriter.close();
+                }
+            }
+        }
+
+        if (schemaOnly) {
+            if (screen != null) {
+                screen.updateStatus("Schema Initialization Completed (Schema Only Mode).");
+                long elapsed = System.currentTimeMillis() - startTimeMillis;
+                String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                        (elapsed / 1000) % 60);
+                screen.updateGlobal("Done", 0, 0, "Finished", startTime.format(dtf), elapsedTimeStr);
+                try {
+                    Thread.sleep(3000);
+                } catch (Exception ignored) {
+                }
+                screen.close();
+            }
+            System.out.println("Schema Initialization Completed Successfully (Schema Only Mode).");
+            mapDbStore.close();
+            pool.close();
+            orientDB.close();
+            return;
+        }
+
+        // Phase 1: Migrating Vertices
+        if (screen != null) {
+            screen.updateStatus("Migrating data...");
+            long elapsed = System.currentTimeMillis() - startTimeMillis;
+            String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                    (elapsed / 1000) % 60);
+            screen.updateGlobal("Migrating Vertices", 0, totalRecordsToMigrate.get(), "Calculating...",
+                    startTime.format(dtf), elapsedTimeStr);
+        }
+        System.out.println("---- Phase 1: Migrating Vertices ----");
+        runWorkers(vertexClasses, false, threadCount, pool, arcadeClient, mapDbStore, skipClasses, onlyThisClasses,
+                screen, batchSize);
+
+        // Phase 2: Migrating Edges
+        if (screen != null) {
+            long elapsed = System.currentTimeMillis() - startTimeMillis;
+            String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                    (elapsed / 1000) % 60);
+            screen.updateGlobal("Migrating Edges", recordsMigrated.get(), totalRecordsToMigrate.get(),
+                    "Calculating...", startTime.format(dtf), elapsedTimeStr);
+        }
+        System.out.println("---- Phase 2: Migrating Edges ----");
+        runWorkers(edgeClasses, true, threadCount, pool, arcadeClient, mapDbStore, skipClasses, onlyThisClasses,
+                screen, batchSize);
+
+        LocalDateTime endTime = LocalDateTime.now();
+
+        if (screen != null) {
+            screen.updateStatus("Migration Completed Successfully!");
+            long elapsed = System.currentTimeMillis() - startTimeMillis;
+            String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                    (elapsed / 1000) % 60);
+            screen.updateGlobal("Done", recordsMigrated.get(), totalRecordsToMigrate.get(),
+                    "Finished at " + endTime.format(dtf), startTime.format(dtf), elapsedTimeStr);
+            try {
+                Thread.sleep(3000);
+            } catch (Exception ignored) {
+            }
+            screen.close();
+        }
+
+        System.out.println("Migration Completed Successfully at: " + endTime.format(dtf));
+
+        mapDbStore.close();
+        pool.close();
+        orientDB.close();
+    }
+
+    private static List<OClass> sortTopologically(List<OClass> classes) {
+        List<OClass> sorted = new ArrayList<>();
+        List<OClass> remaining = new ArrayList<>(classes);
+        while (!remaining.isEmpty()) {
+            boolean progress = false;
+            java.util.Iterator<OClass> it = remaining.iterator();
+            while (it.hasNext()) {
+                OClass c = it.next();
+                boolean hasUnresolvedSuper = false;
+                for (OClass other : remaining) {
+                    if (c != other && c.isSubClassOf(other)) {
+                        hasUnresolvedSuper = true;
+                        break;
+                    }
+                }
+                if (!hasUnresolvedSuper) {
+                    sorted.add(c);
+                    it.remove();
+                    progress = true;
+                }
+            }
+            if (!progress) {
+                sorted.addAll(remaining);
+                break;
+            }
+        }
+        return sorted;
+    }
+
+    private static void runWorkers(List<OClass> classes, boolean isEdge, int threadCount,
+            ODatabasePool pool, ArcadeBatchClient arcadeClient, MapDbStore mapDbStore,
+            List<String> skipClasses, List<String> onlyThisClasses, MigrationScreen screen, int batchSize) {
+        // Find which classes need importing:
+        List<OClass> importClasses = new ArrayList<>();
+        for (OClass oClass : classes) {
+            String className = oClass.getName();
+            boolean toImport = true;
+            if (skipClasses.contains(className)) {
+                toImport = false;
+            } else if (!onlyThisClasses.isEmpty() && !onlyThisClasses.contains(className)) {
+                toImport = false;
+            }
+            if (toImport) {
+                importClasses.add(oClass);
+            }
+        }
+
+        if (importClasses.isEmpty()) {
+            return;
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+
+        try (ODatabaseSession session = pool.acquire()) {
+            int taskIndex = 0;
+            for (OClass oClass : importClasses) {
+                long count = session.countClass(oClass.getName());
+                if (count > 0) {
+                    int workerIndex = taskIndex % threadCount;
+                    executor.submit(new MigrationWorker(oClass.getName(), isEdge, count, pool, arcadeClient, mapDbStore,
+                            screen, workerIndex, batchSize));
+                    taskIndex++;
+                }
+            }
+        }
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(7, TimeUnit.DAYS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void createPropertiesAndIndexes(OClass oClass, ArcadeBatchClient arcadeClient,
+            java.io.PrintWriter dumpWriter) {
+        for (OProperty prop : oClass.declaredProperties()) {
+            try {
+                String propType = prop.getType().name();
+
+                // Traducir de Orient a Arcade
+                if (propType.equals("EMBEDDEDLIST")) {
+                    propType = "LIST";
+                } else if (propType.equals("EMBEDDEDSET")) {
+                    propType = "LIST";
+                } else if (propType.equals("EMBEDDEDMAP")) {
+                    propType = "MAP";
+                }
+
+                String cmd = "CREATE PROPERTY `" + oClass.getName() + "`.`" + prop.getName() + "` IF NOT EXISTS "
+                        + propType;
+                if (dumpWriter != null) {
+                    dumpWriter.println(cmd + ";");
+                } else {
+                    arcadeClient.executeCommand(cmd);
+                }
+
+            } catch (Exception e) {
+                System.err.println("Warning: Could not create property " + prop.getName() + " for class "
+                        + oClass.getName() + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+
+        }
+        for (OIndex idx : oClass.getIndexes()) {
+            try {
+                String idxType = idx.getType();
+                if (idxType.contains("UNIQUE") || idxType.contains("NOTUNIQUE") || idxType.contains("FULLTEXT")) {
+                    String baseType = idxType.contains("NOTUNIQUE") ? "NOTUNIQUE"
+                            : (idxType.contains("UNIQUE") ? "UNIQUE" : "FULL_TEXT");
+                    java.util.List<String> fields = idx.getDefinition().getFields();
+                    if (!fields.isEmpty()) {
+                        java.util.List<String> processedFields = new java.util.ArrayList<>();
+                        for (String field : fields) {
+                            OProperty prop = oClass.getProperty(field);
+                            if (prop != null && (prop.getType().name().equals("EMBEDDEDLIST")
+                                    || prop.getType().name().equals("EMBEDDEDSET"))) {
+                                processedFields.add(field + " BY ITEM");
+                            } else {
+                                processedFields.add(field);
+                            }
+                        }
+                        String fieldsStr = String.join(", ", processedFields);
+                        String cmd = "CREATE INDEX IF NOT EXISTS ON `" + oClass.getName() + "` (" + fieldsStr + ") "
+                                + baseType;
+                        if (dumpWriter != null) {
+                            dumpWriter.println(cmd + ";");
+                        } else {
+                            arcadeClient.executeCommand(cmd);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println(
+                        "Warning: Could not create index for class " + oClass.getName() + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+    }
+}

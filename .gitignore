@@ -1,1 +1,3 @@
 /.vscode
+migration-tool/build/
+migration-tool/.gradle/

@@ -5,12 +5,13 @@
     "ODB_PASS": "toortoor",
     "ADB_HOST": "arcadedb-nodo1-test.intranet",
     "ADB_PORT": 2480,
+    "ADB_GRPCPORT": 50051,
     "ADB_DB": "ogm-test",
     "ADB_USER": "root",
     "ADB_PASS": "toortoor",
     "MAPDB_PATH": "migration_mapping.db",
     "THREADS": 4,
-    "BATCH_SIZE": 10000,
+    "BATCH_SIZE": 50000,
     "CREATE_SCHEMA": true,
     "SKIP": [
         "ODBAuditLog"

@@ -92,4 +92,24 @@ public class ArcadeBatchClient {
             }
         }
     }
+
+    public JsonObject executeQuery(String sqlCommand) throws Exception {
+        String queryUrl = url.replace("/batch/", "/query/");
+        String payload = gson.toJson(Map.of("language", "sql", "command", sqlCommand));
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(queryUrl))
+                .header("Content-Type", "application/json")
+                .header("Authorization", authHeader)
+                .POST(HttpRequest.BodyPublishers.ofString(payload))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200 && response.statusCode() != 201) {
+            throw new RuntimeException("Error executing query [" + sqlCommand + "]: " + response.body());
+        }
+        
+        return gson.fromJson(response.body(), JsonObject.class);
+    }
 }

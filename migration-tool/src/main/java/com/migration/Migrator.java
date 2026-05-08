@@ -58,6 +58,7 @@ public class Migrator {
 
     public static void main(String[] args) {
         boolean schemaOnly = false;
+        boolean checkMigration = false;
         String dumpSchemaPath = null;
         String configPath = "config.json";
         boolean debug = false;
@@ -65,6 +66,8 @@ public class Migrator {
             String arg = args[i];
             if (arg.equalsIgnoreCase("-so")) {
                 schemaOnly = true;
+            } else if (arg.equalsIgnoreCase("-checkMigration")) {
+                checkMigration = true;
             } else if (arg.equalsIgnoreCase("-debug")) {
                 debug = true;
             } else if (arg.equalsIgnoreCase("-dumpSchema") && i + 1 < args.length) {
@@ -90,6 +93,7 @@ public class Migrator {
 
         String adbHost = config.has("ADB_HOST") ? config.get("ADB_HOST").getAsString() : "localhost";
         int adbPort = config.has("ADB_PORT") ? config.get("ADB_PORT").getAsInt() : 2480;
+        int adbGRPCPort = config.has("ADB_GRPCPORT") ? config.get("ADB_GRPCPORT").getAsInt() : 50051;
         String adbDb = config.has("ADB_DB") ? config.get("ADB_DB").getAsString() : "mydb";
         String adbUser = config.has("ADB_USER") ? config.get("ADB_USER").getAsString() : "root";
         String adbPass = config.has("ADB_PASS") ? config.get("ADB_PASS").getAsString() : "root";
@@ -151,17 +155,81 @@ public class Migrator {
                 if (oClass.isSubClassOf("V") && !className.equals("V")) {
                     vertexClasses.add(oClass);
                     if (toImport)
-                        totalRecordsToMigrate.addAndGet(session.countClass(className));
+                        totalRecordsToMigrate.addAndGet(session.countClass(className, false));
                 } else if (oClass.isSubClassOf("E") && !className.equals("E")) {
                     edgeClasses.add(oClass);
                     if (toImport)
-                        totalRecordsToMigrate.addAndGet(session.countClass(className));
+                        totalRecordsToMigrate.addAndGet(session.countClass(className, false));
                 }
             }
         }
 
         vertexClasses = sortTopologically(vertexClasses);
         edgeClasses = sortTopologically(edgeClasses);
+
+        if (checkMigration) {
+            System.out.println("Running migration check...");
+            com.arcadedb.remote.grpc.RemoteGrpcServer grpcServer = null;
+            com.arcadedb.remote.grpc.RemoteGrpcDatabase remoteDb = null;
+            try (ODatabaseSession session = pool.acquire();
+                    java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter("checkStatus.log"))) {
+                grpcServer = new com.arcadedb.remote.grpc.RemoteGrpcServer(adbHost, adbGRPCPort, adbUser, adbPass,
+                        false,
+                        java.util.Collections.emptyList());
+                grpcServer.start();
+                remoteDb = new com.arcadedb.remote.grpc.RemoteGrpcDatabase(grpcServer, adbHost, adbGRPCPort, adbPort,
+                        adbDb, adbUser,
+                        adbPass);
+                for (OClass oClass : session.getMetadata().getSchema().getClasses()) {
+                    String className = oClass.getName();
+                    if (skipClasses.contains(className)
+                            || (!onlyThisClasses.isEmpty() && !onlyThisClasses.contains(className))) {
+                        continue;
+                    }
+                    if ((oClass.isSubClassOf("V") && !className.equals("V"))
+                            || (oClass.isSubClassOf("E") && !className.equals("E"))) {
+                        long odbCount = session.countClass(className, false);
+                        long adbCount = -1;
+                        try {
+                            com.arcadedb.query.sql.executor.ResultSet result = remoteDb.query("sql",
+                                    "SELECT count(*) as cnt FROM `" + className + "`");
+                            if (result.hasNext()) {
+                                adbCount = ((Number) result.next().getProperty("cnt")).longValue();
+                            }
+                            if (odbCount != adbCount) {
+                                pw.printf("Class: %s, OrientDB: %d, ArcadeDB: %d%n", className, odbCount, adbCount);
+                                System.out.printf(
+                                        "Class: %s, OrientDB: %d, ArcadeDB: %d  <<<<<<<< ERROR: no coincide la cantidad de registros %n",
+                                        className, odbCount, adbCount);
+                            } else {
+                                System.out.printf(
+                                        "Class: %s, OrientDB: %d, ArcadeDB: %d >>> Ok! %n   ",
+                                        className, odbCount, adbCount);
+                            }
+                        } catch (Exception e) {
+                            System.err.println(
+                                    "Failed to query count for " + className + " in ArcadeDB: " + e.getMessage());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("Error during checkMigration: " + e.getMessage());
+            } finally {
+                if (remoteDb != null) {
+                    remoteDb.close();
+                }
+                if (grpcServer != null) {
+                    grpcServer.close();
+                }
+            }
+            System.out.println("Check migration completed. See checkStatus.log for details.");
+            if (screen != null)
+                screen.close();
+            mapDbStore.close();
+            pool.close();
+            orientDB.close();
+            return;
+        }
 
         if (screen != null)
             screen.updateGlobal("Initializing Schema", 0, totalRecordsToMigrate.get(), "...", startTime.format(dtf),
@@ -361,7 +429,7 @@ public class Migrator {
         try (ODatabaseSession session = pool.acquire()) {
             int taskIndex = 0;
             for (OClass oClass : importClasses) {
-                long count = session.countClass(oClass.getName());
+                long count = session.countClass(oClass.getName(), false);
                 if (count > 0) {
                     int workerIndex = taskIndex % threadCount;
                     executor.submit(new MigrationWorker(oClass.getName(), isEdge, count, pool, arcadeClient, mapDbStore,
@@ -428,7 +496,9 @@ public class Migrator {
                             }
                         }
                         String fieldsStr = String.join(", ", processedFields);
-                        String cmd = "CREATE INDEX IF NOT EXISTS ON `" + oClass.getName() + "` (" + fieldsStr + ") "
+                        String idxName = idx.getName().replace(".", "_");
+                        String cmd = "CREATE INDEX `" + idxName + "` IF NOT EXISTS ON `" + oClass.getName() + "` ("
+                                + fieldsStr + ") "
                                 + baseType;
                         if (dumpWriter != null) {
                             dumpWriter.println(cmd + ";");

@@ -23,6 +23,10 @@ dependencies {
 
     // Lanterna for TUI
     implementation 'com.googlecode.lanterna:lanterna:3.1.2'
+
+    // ArcadeDB Network (RemoteDatabase / gRPC)
+    implementation 'com.arcadedb:arcadedb-network:26.4.2'
+    implementation 'com.arcadedb:arcadedb-grpc-client:26.4.2'
 }
 
 shadowJar {
@@ -33,4 +37,17 @@ shadowJar {
         attributes 'Main-Class': 'com.migration.Migrator'
     }
     mergeServiceFiles()
+}
+
+configurations.all {
+    resolutionStrategy {
+        capabilitiesResolution {
+            withCapability("org.lz4:lz4-java") {
+                select("at.yawk.lz4:lz4-java:1.11.0")
+            }
+            withCapability("net.jpountz.lz4:lz4") {
+                select("at.yawk.lz4:lz4-java:1.11.0")
+            }
+        }
+    }
 }

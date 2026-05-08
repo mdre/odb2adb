@@ -58,7 +58,8 @@ public class MigrationWorker implements Runnable {
 
         if (screen != null) {
             screen.updateThread(workerIndex,
-                    String.format("Starting %s : %s (0 / %d)", isEdge ? "Edge" : "Vertex", className, totalRecords));
+                    String.format(java.util.Locale.forLanguageTag("es-AR"), "Starting %s : %s (0 / %,d)",
+                            isEdge ? "Edge" : "Vertex", className, totalRecords));
         }
 
         try (ODatabaseSession db = orientPool.acquire()) {
@@ -114,8 +115,10 @@ public class MigrationWorker implements Runnable {
 
                         double percentage = (processed * 100.0) / totalRecords;
                         if (screen != null) {
-                            screen.updateThread(workerIndex, String.format("Class: %s | %d / %d (%.2f%%)", className,
-                                    processed, totalRecords, percentage));
+                            screen.updateThread(workerIndex,
+                                    String.format(java.util.Locale.forLanguageTag("es-AR"),
+                                            "Class: %s | %,d / %,d (%.2f%%)", className,
+                                            processed, totalRecords, percentage));
                         }
                     } catch (Exception e) {
                         try (FileWriter fw = new FileWriter("migration.log", true);
@@ -143,8 +146,10 @@ public class MigrationWorker implements Runnable {
                     processed += currentBatchCount;
                     double percentage = (processed * 100.0) / totalRecords;
                     if (screen != null) {
-                        screen.updateThread(workerIndex, String.format("Class: %s | %d / %d (%.2f%%)", className,
-                                processed, totalRecords, percentage));
+                        screen.updateThread(workerIndex,
+                                String.format(java.util.Locale.forLanguageTag("es-AR"),
+                                        "Class: %s | %,d / %,d (%.2f%%)", className,
+                                        processed, totalRecords, percentage));
                     }
                 } catch (Exception e) {
                     try (FileWriter fw = new FileWriter("migration.log", true);
@@ -159,6 +164,26 @@ public class MigrationWorker implements Runnable {
         if (screen != null) {
             screen.updateThread(workerIndex, String.format("Finished: %s", className));
         }
+
+        long migratedRecords = -1;
+        try {
+            JsonObject response = arcadeClient.executeQuery("SELECT count(*) as cnt FROM `" + className + "`");
+            if (response.has("result") && response.getAsJsonArray("result").size() > 0) {
+                migratedRecords = response.getAsJsonArray("result").get(0).getAsJsonObject().get("cnt").getAsLong();
+            }
+        } catch (Exception e) {
+            System.err.println("Failed to query count for " + className + ": " + e.getMessage());
+        }
+
+        synchronized (MigrationWorker.class) {
+            try (FileWriter fw = new FileWriter("resumen.log", true);
+                    PrintWriter pw = new PrintWriter(fw)) {
+                pw.printf("%s, %d, %d%n", className, totalRecords, migratedRecords);
+            } catch (IOException e) {
+                System.err.println("Failed to write to resumen.log: " + e.getMessage());
+            }
+        }
+
         Migrator.logProgress(threadName, className, totalRecords, screen);
     }
 

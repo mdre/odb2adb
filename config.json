@@ -11,7 +11,10 @@
     "ADB_PASS": "toortoor",
     "MAPDB_PATH": "migration_mapping.db",
     "THREADS": 4,
-    "BATCH_SIZE": 50000,
+    "WORKING_MODE": "BATCH",
+    "VERTEX_BATCH_SIZE": 50000,
+    "EDGE_BATCH_SIZE": 1000,
+    "RETRY_COUNT": 5,
     "CREATE_SCHEMA": true,
     "SKIP": [
         "ODBAuditLog"

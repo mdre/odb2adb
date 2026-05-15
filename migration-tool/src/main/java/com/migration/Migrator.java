@@ -56,23 +56,61 @@ public class Migrator {
         }
     }
 
+    private static void printHelp() {
+        System.out.println("Usage: java -jar odb2adb.jar [options] [configPath]");
+        System.out.println("Options:");
+        System.out.println("  -help, -h          Show this help message");
+        System.out.println("  -so                Schema Only mode. Creates the schema and exits.");
+        System.out.println("  -createSchema      Create schema in ArcadeDB before migration.");
+        System.out.println("  -checkMigration    Check data consistency between OrientDB and ArcadeDB.");
+        System.out.println("  -debug             Enable debug mode and logging.");
+        System.out.println(
+                "  -dumpSchema <name> Dump the ArcadeDB schema creation script to <name>_schemaonly.sql and <name>_index.sql.");
+        System.out.println("  -migrate           Start the record migration process.");
+        System.out.println("  -vertexOnly        Migrate only vertices.");
+        System.out.println("  -edgeOnly          Migrate only edges.");
+        System.out.println(
+                "  -listTargetSourceClass List target and source classes with record counts to targetSourceClass.log.");
+        System.out.println("  [configPath]       Path to the config.json file (default: config.json).");
+    }
+
     public static void main(String[] args) {
         boolean schemaOnly = false;
         boolean checkMigration = false;
+        boolean createSchema = false;
+        boolean migrate = false;
+        boolean vertexOnly = false;
+        boolean edgeOnly = false;
+        boolean listTargetSourceClass = false;
         String dumpSchemaPath = null;
         String configPath = "config.json";
         boolean debug = false;
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
-            if (arg.equalsIgnoreCase("-so")) {
+            if (arg.equalsIgnoreCase("-help") || arg.equalsIgnoreCase("-h")) {
+                printHelp();
+                return;
+            } else if (arg.equalsIgnoreCase("-so")) {
                 schemaOnly = true;
+                createSchema = true;
+            } else if (arg.equalsIgnoreCase("-createSchema")) {
+                createSchema = true;
+            } else if (arg.equalsIgnoreCase("-migrate")) {
+                migrate = true;
             } else if (arg.equalsIgnoreCase("-checkMigration")) {
                 checkMigration = true;
+            } else if (arg.equalsIgnoreCase("-vertexOnly")) {
+                vertexOnly = true;
+            } else if (arg.equalsIgnoreCase("-edgeOnly")) {
+                edgeOnly = true;
+            } else if (arg.equalsIgnoreCase("-listTargetSourceClass")) {
+                listTargetSourceClass = true;
             } else if (arg.equalsIgnoreCase("-debug")) {
                 debug = true;
             } else if (arg.equalsIgnoreCase("-dumpSchema") && i + 1 < args.length) {
                 dumpSchemaPath = args[++i];
                 schemaOnly = true;
+                createSchema = true;
             } else if (!arg.startsWith("-")) {
                 configPath = arg;
             }
@@ -98,9 +136,10 @@ public class Migrator {
         String adbUser = config.has("ADB_USER") ? config.get("ADB_USER").getAsString() : "root";
         String adbPass = config.has("ADB_PASS") ? config.get("ADB_PASS").getAsString() : "root";
 
-        String mapDbPath = config.has("MAPDB_PATH") ? config.get("MAPDB_PATH").getAsString() : "migration_mapping.db";
         int threadCount = config.has("THREADS") ? config.get("THREADS").getAsInt() : 4;
-        int batchSize = config.has("BATCH_SIZE") ? config.get("BATCH_SIZE").getAsInt() : 50000;
+        int vertexBatchSize = config.has("VERTEX_BATCH_SIZE") ? config.get("VERTEX_BATCH_SIZE").getAsInt() : 50000;
+        int edgeBatchSize = config.has("EDGE_BATCH_SIZE") ? config.get("EDGE_BATCH_SIZE").getAsInt() : 50000;
+        int retryCount = config.has("RETRY_COUNT") ? config.get("RETRY_COUNT").getAsInt() : 3;
 
         startTime = LocalDateTime.now();
         startTimeMillis = System.currentTimeMillis();
@@ -111,7 +150,6 @@ public class Migrator {
 
         ArcadeBatchClient arcadeClient = new ArcadeBatchClient(adbHost, adbPort, adbDb, adbUser, adbPass);
         arcadeClient.setDebug(debug);
-        MapDbStore mapDbStore = new MapDbStore(mapDbPath);
 
         MigrationScreen screen = new MigrationScreen(threadCount);
         try {
@@ -129,7 +167,6 @@ public class Migrator {
 
         List<OClass> vertexClasses = new ArrayList<>();
         List<OClass> edgeClasses = new ArrayList<>();
-        boolean createSchema = config.has("CREATE_SCHEMA") ? config.get("CREATE_SCHEMA").getAsBoolean() : true;
 
         List<String> skipClasses = new ArrayList<>();
         if (config.has("SKIP")) {
@@ -142,14 +179,41 @@ public class Migrator {
         }
 
         try (ODatabaseSession session = pool.acquire()) {
+            if (listTargetSourceClass) {
+                new java.io.File("targetSourceClass.log").delete();
+            }
             for (OClass oClass : session.getMetadata().getSchema().getClasses()) {
                 String className = oClass.getName();
                 boolean toImport = true;
+                String ignoreReason = null;
+
+                if (listTargetSourceClass) {
+                    long count = session.countClass(className, false);
+                    try (java.io.FileWriter fw = new java.io.FileWriter("targetSourceClass.log", true);
+                            java.io.PrintWriter pw = new java.io.PrintWriter(fw)) {
+                        pw.printf("[%s] %s, Records: %d%n", oClass.isEdgeType() ? "EDGE" : "VERTEX", className, count);
+                    } catch (IOException e) {
+                        System.err.println("Failed to write to targetSourceClass.log: " + e.getMessage());
+                    }
+                }
 
                 if (skipClasses.contains(className)) {
                     toImport = false;
+                    ignoreReason = "In SKIP list";
                 } else if (!onlyThisClasses.isEmpty() && !onlyThisClasses.contains(className)) {
                     toImport = false;
+                    ignoreReason = "Not in ONLY_THIS list";
+                }
+
+                if (!toImport) {
+                    String classType = oClass.isSubClassOf("V") ? "Vertex"
+                            : (oClass.isSubClassOf("E") ? "Edge" : "Unknown");
+                    try (java.io.FileWriter fw = new java.io.FileWriter("ignoredclass.log", true);
+                            java.io.PrintWriter pw = new java.io.PrintWriter(fw)) {
+                        pw.printf("[%s] Class: %s ignored - Reason: %s%n", classType, className, ignoreReason);
+                    } catch (IOException e) {
+                        System.err.println("Failed to write to ignoredclass.log: " + e.getMessage());
+                    }
                 }
 
                 if (oClass.isSubClassOf("V") && !className.equals("V")) {
@@ -225,7 +289,6 @@ public class Migrator {
             System.out.println("Check migration completed. See checkStatus.log for details.");
             if (screen != null)
                 screen.close();
-            mapDbStore.close();
             pool.close();
             orientDB.close();
             return;
@@ -242,9 +305,11 @@ public class Migrator {
             System.out.println(dumpSchemaPath != null ? "Dumping schema to file: " + dumpSchemaPath
                     : "Initializing schema in ArcadeDB...");
             java.io.PrintWriter dumpWriter = null;
+            java.io.PrintWriter indexWriter = null;
             try {
                 if (dumpSchemaPath != null) {
-                    dumpWriter = new java.io.PrintWriter(new java.io.FileWriter(dumpSchemaPath));
+                    dumpWriter = new java.io.PrintWriter(new java.io.FileWriter(dumpSchemaPath + "_schemaonly.sql"));
+                    indexWriter = new java.io.PrintWriter(new java.io.FileWriter(dumpSchemaPath + "_index.sql"));
                 }
                 try (ODatabaseSession session = pool.acquire()) {
                     for (OClass vClass : vertexClasses) {
@@ -267,13 +332,15 @@ public class Migrator {
                             String cmd3 = "CREATE INDEX IF NOT EXISTS ON `" + vClass.getName() + "` (odbRID) NOTUNIQUE";
                             if (dumpWriter != null) {
                                 dumpWriter.println(cmd2 + ";");
+                                // este índice se crea facilitar el proceso de migración y no es estrictamente
+                                // necesario
                                 dumpWriter.println(cmd3 + ";");
                             } else {
                                 arcadeClient.executeCommand(cmd2);
                                 arcadeClient.executeCommand(cmd3);
                             }
                         }
-                        createPropertiesAndIndexes(vClass, arcadeClient, dumpWriter);
+                        createPropertiesAndIndexes(vClass, arcadeClient, dumpWriter, indexWriter);
                     }
                     for (OClass eClass : edgeClasses) {
                         List<String> superTypes = new ArrayList<>();
@@ -289,7 +356,7 @@ public class Migrator {
                         } else {
                             arcadeClient.executeCommand(cmd1);
                         }
-                        createPropertiesAndIndexes(eClass, arcadeClient, dumpWriter);
+                        createPropertiesAndIndexes(eClass, arcadeClient, dumpWriter, indexWriter);
                     }
                 }
             } catch (Exception e) {
@@ -301,6 +368,9 @@ public class Migrator {
             } finally {
                 if (dumpWriter != null) {
                     dumpWriter.close();
+                }
+                if (indexWriter != null) {
+                    indexWriter.close();
                 }
             }
         }
@@ -319,36 +389,40 @@ public class Migrator {
                 screen.close();
             }
             System.out.println("Schema Initialization Completed Successfully (Schema Only Mode).");
-            mapDbStore.close();
             pool.close();
             orientDB.close();
             return;
         }
 
+        MapDBStore.init();
         // Phase 1: Migrating Vertices
-        if (screen != null) {
-            screen.updateStatus("Migrating data...");
-            long elapsed = System.currentTimeMillis() - startTimeMillis;
-            String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
-                    (elapsed / 1000) % 60);
-            screen.updateGlobal("Migrating Vertices", 0, totalRecordsToMigrate.get(), "Calculating...",
-                    startTime.format(dtf), elapsedTimeStr);
+        if (migrate && !edgeOnly) {
+            if (screen != null) {
+                screen.updateStatus("Migrating data...");
+                long elapsed = System.currentTimeMillis() - startTimeMillis;
+                String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                        (elapsed / 1000) % 60);
+                screen.updateGlobal("Migrating Vertices", 0, totalRecordsToMigrate.get(), "Calculating...",
+                        startTime.format(dtf), elapsedTimeStr);
+            }
+            System.out.println("---- Phase 1: Migrating Vertices ----");
+            runWorkers(vertexClasses, false, threadCount, pool, arcadeClient, skipClasses, onlyThisClasses,
+                    screen, vertexBatchSize, retryCount, config);
         }
-        System.out.println("---- Phase 1: Migrating Vertices ----");
-        runWorkers(vertexClasses, false, threadCount, pool, arcadeClient, mapDbStore, skipClasses, onlyThisClasses,
-                screen, batchSize);
 
         // Phase 2: Migrating Edges
-        if (screen != null) {
-            long elapsed = System.currentTimeMillis() - startTimeMillis;
-            String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
-                    (elapsed / 1000) % 60);
-            screen.updateGlobal("Migrating Edges", recordsMigrated.get(), totalRecordsToMigrate.get(),
-                    "Calculating...", startTime.format(dtf), elapsedTimeStr);
+        if (migrate && !vertexOnly) {
+            if (screen != null) {
+                long elapsed = System.currentTimeMillis() - startTimeMillis;
+                String elapsedTimeStr = String.format("%02d:%02d:%02d", elapsed / 3600000, (elapsed / 60000) % 60,
+                        (elapsed / 1000) % 60);
+                screen.updateGlobal("Migrating Edges", recordsMigrated.get(), totalRecordsToMigrate.get(),
+                        "Calculating...", startTime.format(dtf), elapsedTimeStr);
+            }
+            System.out.println("---- Phase 2: Migrating Edges ----");
+            runWorkers(edgeClasses, true, threadCount, pool, arcadeClient, skipClasses, onlyThisClasses,
+                    screen, edgeBatchSize, retryCount, config);
         }
-        System.out.println("---- Phase 2: Migrating Edges ----");
-        runWorkers(edgeClasses, true, threadCount, pool, arcadeClient, mapDbStore, skipClasses, onlyThisClasses,
-                screen, batchSize);
 
         LocalDateTime endTime = LocalDateTime.now();
 
@@ -368,9 +442,9 @@ public class Migrator {
 
         System.out.println("Migration Completed Successfully at: " + endTime.format(dtf));
 
-        mapDbStore.close();
         pool.close();
         orientDB.close();
+        MapDBStore.close();
     }
 
     private static List<OClass> sortTopologically(List<OClass> classes) {
@@ -403,8 +477,9 @@ public class Migrator {
     }
 
     private static void runWorkers(List<OClass> classes, boolean isEdge, int threadCount,
-            ODatabasePool pool, ArcadeBatchClient arcadeClient, MapDbStore mapDbStore,
-            List<String> skipClasses, List<String> onlyThisClasses, MigrationScreen screen, int batchSize) {
+            ODatabasePool pool, ArcadeBatchClient arcadeClient,
+            List<String> skipClasses, List<String> onlyThisClasses, MigrationScreen screen, int batchSize,
+            int retryCount, JsonObject config) {
         // Find which classes need importing:
         List<OClass> importClasses = new ArrayList<>();
         for (OClass oClass : classes) {
@@ -432,9 +507,17 @@ public class Migrator {
                 long count = session.countClass(oClass.getName(), false);
                 if (count > 0) {
                     int workerIndex = taskIndex % threadCount;
-                    executor.submit(new MigrationWorker(oClass.getName(), isEdge, count, pool, arcadeClient, mapDbStore,
-                            screen, workerIndex, batchSize));
+                    executor.submit(new MigrationWorker(oClass.getName(), isEdge, count, pool, arcadeClient,
+                            screen, workerIndex, batchSize, retryCount, config));
                     taskIndex++;
+                } else {
+                    String classType = isEdge ? "Edge" : "Vertex";
+                    try (java.io.FileWriter fw = new java.io.FileWriter("ignoredclass.log", true);
+                            java.io.PrintWriter pw = new java.io.PrintWriter(fw)) {
+                        pw.printf("[%s] Class: %s ignored - Reason: 0 records%n", classType, oClass.getName());
+                    } catch (IOException e) {
+                        System.err.println("Failed to write to ignoredclass.log: " + e.getMessage());
+                    }
                 }
             }
         }
@@ -448,7 +531,7 @@ public class Migrator {
     }
 
     private static void createPropertiesAndIndexes(OClass oClass, ArcadeBatchClient arcadeClient,
-            java.io.PrintWriter dumpWriter) {
+            java.io.PrintWriter dumpWriter, java.io.PrintWriter indexWriter) {
         for (OProperty prop : oClass.declaredProperties()) {
             try {
                 String propType = prop.getType().name();
@@ -500,8 +583,8 @@ public class Migrator {
                         String cmd = "CREATE INDEX `" + idxName + "` IF NOT EXISTS ON `" + oClass.getName() + "` ("
                                 + fieldsStr + ") "
                                 + baseType;
-                        if (dumpWriter != null) {
-                            dumpWriter.println(cmd + ";");
+                        if (indexWriter != null) {
+                            indexWriter.println(cmd + ";");
                         } else {
                             arcadeClient.executeCommand(cmd);
                         }
